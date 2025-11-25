@@ -55,6 +55,7 @@ memory_cleanup_interval = 30  # 每30秒清理一次
 memory_usage_fixed = 0  # 固定的内存使用量显示
 last_memory_update = 0  # 上次内存更新时间
 memory_update_interval = 0.5  # 每0.5秒更新一次内存显示
+
 # ======================标记，用于快速翻阅时定位到此段代码
 
 def get_current_memory_usage():
