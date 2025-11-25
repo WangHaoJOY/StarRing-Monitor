@@ -48,14 +48,13 @@ performance_mode = "normal"  # 性能模式：normal, optimized, fast
 # 绿框显示控制
 green_box_visible = True  # 绿框是否显示
 
-# 添加内存优化变量
+# 添加内存优化变量 
 memory_pool = {}  # 对象池，避免频繁创建销毁
 last_memory_cleanup = 0
 memory_cleanup_interval = 30  # 每30秒清理一次
 memory_usage_fixed = 0  # 固定的内存使用量显示
 last_memory_update = 0  # 上次内存更新时间
 memory_update_interval = 0.5  # 每0.5秒更新一次内存显示
-
 # ======================标记，用于快速翻阅时定位到此段代码
 
 def get_current_memory_usage():
@@ -638,7 +637,7 @@ def proportional_window_resize_with_zoom():
     motion_value_fixed = 0
     mouse_x, mouse_y = 0, 0
     mouse_in_window = False
-    # === 添加气泡弹窗变量 ===
+    # 添加气泡弹窗变量
     bubble_messages = []  # 存储消息列表
     bubble_duration = 2.0  # 显示2秒
     bubble_fade_duration = 0.5  # 渐变消失时间
@@ -769,7 +768,7 @@ def proportional_window_resize_with_zoom():
             memory_usage_fixed = get_current_memory_usage()
             last_memory_update = current_time
         
-        # === 30秒自动内存清理 ===
+        # 30秒自动内存清理
         if current_time - last_memory_cleanup >= 20:  # 20秒自动清理
             try:
                 memory_usage = get_current_memory_usage()
@@ -1008,7 +1007,7 @@ def proportional_window_resize_with_zoom():
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, green_box_color, 1)
         bottom_info_y += 20
 
-        # === 内存使用量显示（在性能模式上方）===
+        # 内存使用量显示（在性能模式上方）
         memory_color = (0, 255, 255)  # 黄色
         cv2.putText(final_frame, f"Memory Usage: {memory_usage_fixed:.1f}MB (Press C)", 
                    (current_width - 280, current_height - 70), 
@@ -1056,7 +1055,7 @@ def proportional_window_resize_with_zoom():
         cv2.putText(final_frame, f"Longitude: {longitude}", (right_info_x, right_info_y), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
-        # 使用PIL绘制气泡弹窗
+        # 使用PIL绘制气泡弹窗 
         current_time = time.time()
         # 清理过期消息
         bubble_messages = [msg for msg in bubble_messages 
