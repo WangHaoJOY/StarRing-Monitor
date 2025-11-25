@@ -1,0 +1,1146 @@
+import os
+# 隐藏FFmpeg警告并优化性能
+os.environ['OPENCV_FFMPEG_LOGLEVEL'] = '-8'
+os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
+os.environ['OPENCV_VIDEOIO_DEBUG'] = '0'
+
+import cv2
+import numpy as np
+import time
+from datetime import datetime
+import requests
+import json
+import psutil
+from requests.auth import HTTPDigestAuth
+from PIL import Image, ImageDraw, ImageFont
+
+# 检查CUDA可用性并导入PyTorch
+try:
+    import torch
+    import torch.nn.functional as F
+    CUDA_AVAILABLE = torch.cuda.is_available()
+    if CUDA_AVAILABLE:
+        print(f"CUDA可用，使用GPU: {torch.cuda.get_device_name()}")
+        device = torch.device('cuda')
+    else:
+        print("CUDA不可用，使用CPU")
+        device = torch.device('cpu')
+except ImportError:
+    print("PyTorch未安装，使用CPU")
+    CUDA_AVAILABLE = False
+    device = None
+
+# 运动检测相关变量
+motion_detection_enabled = True
+motion_grid = []
+last_frame = None
+last_frame_tensor = None
+last_frame_small = None  # 新增：用于快速检测的小尺寸帧
+motion_threshold = 16  # 降低阈值提高灵敏度
+grid_size = 85       # 减小网格大小，更密集
+
+# 性能优化变量
+frame_skip_counter = 0
+frame_skip_interval = 1  # 每2帧处理1帧
+min_motion_area = 50     # 最小运动区域面积阈值
+performance_mode = "normal"  # 性能模式：normal, optimized, fast
+
+# 绿框显示控制
+green_box_visible = True  # 绿框是否显示
+
+# === 添加内存优化变量 ===
+memory_pool = {}  # 对象池，避免频繁创建销毁
+last_memory_cleanup = 0
+memory_cleanup_interval = 30  # 每30秒清理一次
+memory_usage_fixed = 0  # 固定的内存使用量显示
+last_memory_update = 0  # 上次内存更新时间
+memory_update_interval = 0.5  # 每0.5秒更新一次内存显示
+# ======================标记，用于快速翻阅时定位到此段代码
+
+def get_current_memory_usage():
+    """获取当前内存使用情况"""
+    try:
+        process = psutil.Process()
+        return process.memory_info().rss / 1024 / 1024
+    except:
+        return 0
+
+def create_gaussian_kernel(kernel_size=21, sigma=3.0):
+    """创建高斯核"""
+    if CUDA_AVAILABLE:
+        x = torch.arange(kernel_size, device=device).float() - kernel_size // 2
+    else:
+        x = torch.arange(kernel_size).float() - kernel_size // 2
+    gauss_kernel = torch.exp(-x**2 / (2 * sigma**2))
+    gauss_kernel = gauss_kernel / gauss_kernel.sum()
+    gauss_kernel_2d = gauss_kernel.unsqueeze(1) * gauss_kernel.unsqueeze(0)
+    gauss_kernel_2d = gauss_kernel_2d.unsqueeze(0).unsqueeze(0)
+    return gauss_kernel_2d
+
+def cpu_detect_motion_grid(current_frame):
+    """CPU版本的运动检测"""
+    global last_frame
+    
+    if last_frame is None:
+        last_frame = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+        return []
+    
+    gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+    gray_blur = cv2.GaussianBlur(gray, (21, 21), 0)
+    frame_diff = cv2.absdiff(last_frame, gray_blur)
+    _, thresh = cv2.threshold(frame_diff, motion_threshold, 255, cv2.THRESH_BINARY)
+    
+    kernel = np.ones((3, 3), np.uint8)
+    thresh = cv2.dilate(thresh, kernel, iterations=2)
+    
+    motion_grid = []
+    h, w = thresh.shape
+    
+    for y in range(0, h, grid_size):
+        for x in range(0, w, grid_size):
+            grid_region = thresh[y:min(y+grid_size, h), x:min(x+grid_size, w)]
+            if np.sum(grid_region) > 0:
+                motion_grid.append((x, y, grid_size, grid_size))
+    
+    last_frame = gray_blur
+    return motion_grid
+
+def optimized_cuda_detect_motion_grid(current_frame):
+    global last_frame_tensor
+    
+    if not CUDA_AVAILABLE:
+        return cpu_detect_motion_grid(current_frame)
+    
+    try:
+        # 简化的方法：使用CPU预处理，CUDA进行核心计算
+        # 1. 在CPU上转换为灰度图
+        gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+        gray_blur = cv2.GaussianBlur(gray, (21, 21), 0)
+        
+        # 2. 将处理后的灰度图发送到GPU
+        current_tensor = torch.from_numpy(gray_blur).float().to(device).unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+        
+        if last_frame_tensor is None:
+            last_frame_tensor = current_tensor
+            return []
+        
+        # 3. 在GPU上计算帧差异
+        frame_diff_tensor = torch.abs(last_frame_tensor - current_tensor)
+        
+        # 4. 二值化
+        thresh_tensor = (frame_diff_tensor > motion_threshold).float() * 255
+        
+        # 5. 膨胀操作
+        thresh_tensor = F.max_pool2d(thresh_tensor, kernel_size=3, stride=1, padding=1)
+        
+        # 6. 检测运动网格
+        motion_grid = []
+        thresh_np = thresh_tensor.squeeze().byte().cpu().numpy()
+        h, w = thresh_np.shape
+        
+        for y in range(0, h, grid_size):
+            for x in range(0, w, grid_size):
+                grid_region = thresh_np[y:min(y+grid_size, h), x:min(x+grid_size, w)]
+                if np.sum(grid_region) > 0:
+                    motion_grid.append((x, y, grid_size, grid_size))
+        
+        # 更新上一帧
+        last_frame_tensor = current_tensor
+        
+        return motion_grid
+        
+    except Exception as e:
+        print(f"CUDA检测错误，回退到CPU: {e}")
+        return cpu_detect_motion_grid(current_frame)
+
+def cleanup_memory():
+    """定期清理内存"""
+    global memory_pool, last_frame_tensor, last_frame, last_frame_small
+    
+    # 强制垃圾回收
+    import gc
+    gc.collect()
+    
+    if CUDA_AVAILABLE:
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()  # 等待CUDA操作完成
+    
+    # 清理过大的缓冲区
+    for key in list(memory_pool.keys()):
+        if hasattr(memory_pool[key], 'nbytes') and memory_pool[key].nbytes > 5 * 1024 * 1024:  # 降低到5MB
+            del memory_pool[key]
+    
+    # 清理运动检测相关的大缓冲区
+    if last_frame is not None and hasattr(last_frame, 'nbytes') and last_frame.nbytes > 10 * 1024 * 1024:
+        last_frame = None
+    if last_frame_small is not None and hasattr(last_frame_small, 'nbytes') and last_frame_small.nbytes > 2 * 1024 * 1024:
+        last_frame_small = None
+    
+    memory_usage = get_current_memory_usage()
+    print(f"内存清理完成 - 当前内存使用: {memory_usage:.1f}MB")
+    return memory_usage
+
+def show_bubble_message(messages, text):
+    """显示气泡消息"""
+    messages.append({
+        'text': text,
+        'start_time': time.time(),
+        'alpha': 1.0
+    })
+
+def fast_motion_detection(current_frame):
+    """快速运动检测 - 用于大面积运动时的降级处理"""
+    global last_frame_small
+    
+    try:
+        gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+        gray_small = cv2.resize(gray, (0, 0), fx=0.5, fy=0.5)
+        
+        if last_frame_small is None:
+            last_frame_small = gray_small
+            return []
+        
+        # 确保尺寸匹配
+        if last_frame_small.shape != gray_small.shape:
+            last_frame_small = cv2.resize(last_frame_small, (gray_small.shape[1], gray_small.shape[0]))
+        
+        frame_diff = cv2.absdiff(last_frame_small, gray_small)
+        _, thresh = cv2.threshold(frame_diff, motion_threshold + 5, 255, cv2.THRESH_BINARY)  # 降低阈值
+        
+        kernel = np.ones((3, 3), np.uint8)
+        thresh = cv2.dilate(thresh, kernel, iterations=1)
+        
+        motion_ratio = np.sum(thresh) / (thresh.shape[0] * thresh.shape[1] * 255)
+        
+        motion_grid = []
+        h, w = current_frame.shape[:2]
+        
+        if motion_ratio > 0.05:  
+            motion_grid.append((0, 0, w, h))
+        elif motion_ratio > 0.005:  
+            motion_grid.append((0, 0, w//2, h//2))
+            motion_grid.append((w//2, 0, w//2, h//2))
+            motion_grid.append((0, h//2, w//2, h//2))
+            motion_grid.append((w//2, h//2, w//2, h//2))
+        
+        last_frame_small = gray_small
+        return motion_grid
+        
+    except Exception as e:
+        print(f"快速运动检测错误: {e}")
+        return []
+
+def adaptive_motion_detection(current_frame, current_fps):
+    """自适应运动检测 - 根据性能需求调整检测级别"""
+    global frame_skip_counter, performance_mode
+    
+    # 如果帧率过低，完全跳过运动检测
+    if current_fps < 8:
+        return []
+    
+    # 帧跳过机制 - 根据性能调整间隔
+    if current_fps < 15:
+        frame_skip_interval = 2  # 每3帧处理1帧
+    else:
+        frame_skip_interval = 1  # 每2帧处理1帧
+        
+    frame_skip_counter = (frame_skip_counter + 1) % (frame_skip_interval + 1)
+    if frame_skip_counter != 0:
+        return []
+    
+    # 根据帧率自动选择模式
+    if current_fps < 10:
+        performance_mode = "fast"
+        return fast_motion_detection(current_frame)
+    elif current_fps < 20:
+        performance_mode = "optimized"
+        return optimized_cuda_detect_motion_grid(current_frame)
+    else:
+        performance_mode = "normal"
+        return optimized_cuda_detect_motion_grid(current_frame)
+
+def get_location_by_ip():
+    """通过IP地址获取大致地理位置"""
+    try:
+        response = requests.get('http://ip-api.com/json/', timeout=3)
+        data = response.json()
+        if data['status'] == 'success':
+            return data['lat'], data['lon'], data['city'], data['country']
+        else:
+            return None, None, "Unknown", "Unknown"
+    except:
+        return None, None, "Unknown", "Unknown"
+
+def format_coordinates(lat, lon):
+    if lat is None or lon is None:
+        return "Unknown", "Unknown"
+    
+    lat_direction = "N" if lat >= 0 else "S"
+    lat_value = abs(lat)
+    
+    lon_direction = "E" if lon >= 0 else "W"
+    lon_value = abs(lon)
+    
+    latitude = f"{lat_value:.4f} {lat_direction}"
+    longitude = f"{lon_value:.4f} {lon_direction}"
+    
+    return latitude, longitude
+
+def get_system_time():
+    """获取系统时间"""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def reconnect_camera(rtsp_url, max_retries=5):
+    """重新连接摄像头"""
+    for attempt in range(max_retries):
+        print(f"Attempting to reconnect... ({attempt + 1}/{max_retries})")
+        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+    
+    # 优化视频流参数
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FPS, 20)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+        ret, test_frame = cap.read()
+        if ret and test_frame is not None:
+            print("Reconnection successful!")
+            return cap
+        else:
+            cap.release()
+            time.sleep(2)
+    
+    print("Failed to reconnect after multiple attempts")
+    return None
+
+def get_network_bitrate():
+    """通过监控网络接口流量获取实时比特率"""
+    try:
+        stats = psutil.net_io_counters(pernic=True)
+        total_bytes = 0
+        active_interface = "Unknown"
+        
+        for interface, data in stats.items():
+            if interface not in ['lo', 'Loopback'] and data.bytes_recv > 0:
+                total_bytes += data.bytes_recv
+                active_interface = interface
+                
+        return total_bytes, active_interface
+    except:
+        return 0, "Unknown"
+
+def set_hikvision_day_night(ip, username, password, mode):
+    """设置海康威视摄像机日夜模式"""
+    try:
+        url = f"http://{ip}/ISAPI/Image/channels/1"
+        
+        if mode == 0:  # 白天
+            xml_data = """<?xml version="1.0" encoding="UTF-8"?>
+<ImageChannel version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">
+    <IrcutFilter>
+        <IrcutFilterType>day</IrcutFilterType>
+    </IrcutFilter>
+</ImageChannel>"""
+        elif mode == 1:  # 夜晚
+            xml_data = """<?xml version="1.0" encoding="UTF-8"?>
+<ImageChannel version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">
+    <IrcutFilter>
+        <IrcutFilterType>night</IrcutFilterType>
+    </IrcutFilter>
+</ImageChannel>"""
+        else:  # 自动
+            xml_data = """<?xml version="1.0" encoding="UTF-8"?>
+<ImageChannel version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">
+    <IrcutFilter>
+        <IrcutFilterType>auto</IrcutFilterType>
+    </IrcutFilter>
+</ImageChannel>"""
+        
+        response = requests.put(
+            url,
+            data=xml_data,
+            auth=HTTPDigestAuth(username, password),
+            headers={'Content-Type': 'application/xml'},
+            timeout=5
+        )
+        
+        if response.status_code == 200:
+            mode_names = ["白天", "夜晚", "自动"]
+            print(f"日夜模式切换成功: {mode_names[mode]}")
+            return True
+        else:
+            print(f"日夜模式切换失败: HTTP {response.status_code}")
+            return False
+            
+    except Exception as e:
+        print(f"日夜模式设置错误: {e}")
+        return False
+
+def get_hikvision_day_night(ip, username, password):
+    """获取海康威视摄像机当前日夜模式"""
+    try:
+        url = f"http://{ip}/ISAPI/Image/channels/1"
+        response = requests.get(
+            url,
+            auth=HTTPDigestAuth(username, password),
+            timeout=5
+        )
+        
+        if response.status_code == 200:
+            if "<IrcutFilterType>day</IrcutFilterType>" in response.text:
+                return 0
+            elif "<IrcutFilterType>night</IrcutFilterType>" in response.text:
+                return 1
+            elif "<IrcutFilterType>auto</IrcutFilterType>" in response.text:
+                return 2
+            else:
+                print("未找到日夜模式信息")
+                return 2
+        else:
+            print(f"获取日夜模式失败: HTTP {response.status_code}")
+            return 2
+    except Exception as e:
+        print(f"获取日夜模式错误: {e}")
+        return 2
+
+def get_rtsp_bitrate():
+    """使用FFprobe获取RTSP流真实比特率"""
+    try:
+        import subprocess
+        cmd = ['ffprobe', '-v', 'quiet', '-select_streams', 'v:0', 
+               '-show_entries', 'stream=bit_rate', '-of', 'csv=p=0',
+               'rtsp://admin:123456@169.254.30.200:554/Streaming/Channels/101']
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            bitrate_bps = int(result.stdout.strip())
+            return bitrate_bps / 1000000
+        return 4.5
+    except:
+        return 4.5
+
+def cuda_apply_zoom(frame, zoom_factor, mouse_x, mouse_y, current_width, current_height):
+    """使用CUDA加速的缩放操作"""
+    if not CUDA_AVAILABLE or zoom_factor == 1.0:
+        return frame
+    
+    try:
+        # 使用更快的插值方法
+        if zoom_factor > 2.0:
+            interpolation = cv2.INTER_LANCZOS4
+        else:
+            interpolation = cv2.INTER_LINEAR
+        
+        h, w = frame.shape[:2]
+        new_w = int(w / zoom_factor)
+        new_h = int(h / zoom_factor)
+        
+        # 计算裁剪区域（以鼠标位置为中心）
+        rel_x = mouse_x / current_width
+        rel_y = mouse_y / current_height
+        center_x = int(rel_x * w)
+        center_y = int(rel_y * h)
+        
+        # 计算裁剪边界
+        x1 = max(0, center_x - new_w // 2)
+        y1 = max(0, center_y - new_h // 2)
+        x2 = min(w, x1 + new_w)
+        y2 = min(h, y1 + new_h)
+        
+        # 调整边界
+        if x2 - x1 < new_w:
+            if x1 == 0:
+                x2 = min(w, x1 + new_w)
+            else:
+                x1 = max(0, x2 - new_w)
+        if y2 - y1 < new_h:
+            if y1 == 0:
+                y2 = min(h, y1 + new_h)
+            else:
+                y1 = max(0, y2 - new_h)
+        
+        # 使用OpenCV进行裁剪和缩放（在大多数情况下比PyTorch更快）
+        if x2 > x1 and y2 > y1:
+            cropped = frame[y1:y2, x1:x2]
+            zoomed = cv2.resize(cropped, (w, h), interpolation=interpolation)
+            return zoomed
+        
+        return frame
+        
+    except Exception as e:
+        print(f"CUDA缩放错误，回退到CPU: {e}")
+        return frame
+
+def draw_bubble_messages_pil(final_frame, bubble_messages, current_width, current_height, 
+                            bubble_duration=2.0, bubble_fade_duration=0.5):
+    """使用PIL绘制中文气泡消息"""
+    if not bubble_messages:
+        return final_frame
+    
+    try:
+        # 将OpenCV BGR图像转换为PIL RGB图像
+        pil_image = Image.fromarray(cv2.cvtColor(final_frame, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(pil_image)
+        
+        # 尝试加载中文字体
+        try:
+            # 尝试常见的中文字体路径
+            font_paths = [
+                "C:/Windows/Fonts/simhei.ttf",  # Windows 黑体
+                "C:/Windows/Fonts/msyh.ttc",    # Windows 微软雅黑
+                "/System/Library/Fonts/PingFang.ttc",  # macOS
+                "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",  # Linux
+                "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",  # Linux
+            ]
+            
+            font = None
+            for font_path in font_paths:
+                if os.path.exists(font_path):
+                    try:
+                        font = ImageFont.truetype(font_path, 20)
+                        break
+                    except:
+                        continue
+            
+            # 如果找不到中文字体，使用默认字体
+            if font is None:
+                font = ImageFont.load_default()
+                print("使用默认字体，中文显示可能不正常")
+        except Exception as e:
+            print(f"字体加载失败: {e}")
+            font = ImageFont.load_default()
+        
+        current_time = time.time()
+        
+        # 绘制每个气泡消息
+        for i, msg in enumerate(bubble_messages):
+            elapsed = current_time - msg['start_time']
+            
+            # 计算透明度（渐变消失）
+            if elapsed > bubble_duration:
+                # 进入渐变消失阶段
+                fade_progress = (elapsed - bubble_duration) / bubble_fade_duration
+                alpha = max(0.0, 1.0 - fade_progress)
+            else:
+                alpha = 1.0
+            
+            # 更新透明度
+            msg['alpha'] = alpha
+            
+            # 气泡位置（右边中间）
+            bubble_width = 280
+            bubble_height = 35
+            bubble_x = current_width - bubble_width - 20
+            bubble_y = current_height // 2 - len(bubble_messages) * 45 + i * 45
+            
+            # 确保气泡在窗口范围内
+            if bubble_y < 0:
+                bubble_y = 20 + i * 45
+            elif bubble_y + bubble_height > current_height:
+                bubble_y = current_height - bubble_height - 20 - (len(bubble_messages) - i - 1) * 45
+            
+            # 绘制气泡背景（带圆角）
+            bg_color = (0, 0, 0, int(200 * alpha))  # 黑色半透明背景
+            outline_color = (255, 255, 255, int(255 * alpha))  # 白色边框
+            
+            # 创建圆角矩形
+            corners = [
+                (bubble_x, bubble_y),
+                (bubble_x + bubble_width, bubble_y + bubble_height)
+            ]
+            
+            # 绘制背景
+            draw.rectangle(corners, fill=bg_color[:3])
+            
+            # 绘制边框
+            draw.rectangle(corners, outline=outline_color[:3], width=2)
+            
+            # 绘制文字
+            text_color = (255, 255, 255, int(255 * alpha))
+            text_x = bubble_x + 10
+            text_y = bubble_y + 8
+            
+            # 使用PIL绘制文字（支持中文）
+            draw.text((text_x, text_y), msg['text'], fill=text_color[:3], font=font)
+        
+        # 将PIL图像转换回OpenCV格式
+        final_frame_with_bubbles = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+        return final_frame_with_bubbles
+        
+    except Exception as e:
+        print(f"PIL气泡消息绘制错误: {e}")
+        return final_frame
+
+def proportional_window_resize_with_zoom():
+    """主函数 - 保留黑框布局，窗口按比例调整，视频保持原始分辨率"""
+    
+    rtsp_url = "rtsp://admin:123456@169.254.30.200:554/Streaming/Channels/101"
+    cam_ip = "169.254.30.200"
+    cam_username = "admin"
+    cam_password = "123456"
+    
+    # 使用更高效的RTSP参数
+    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+    
+    # 优化视频流参数
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 最小化缓冲区
+    cap.set(cv2.CAP_PROP_FPS, 20)        # 降低帧率
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'H264'))
+    # 使用原始分辨率
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    # 优化解码参数
+    cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+    if not cap.isOpened():
+        print("Cannot connect to camera!")
+        return
+    
+    print(f"CUDA加速状态: {'启用' if CUDA_AVAILABLE else '禁用'}")
+    
+    # 获取视频原始分辨率
+    ret, test_frame = cap.read()
+    if ret and test_frame is not None:
+        video_height, video_width = test_frame.shape[:2]
+        video_aspect_ratio = video_width / video_height
+        print(f"视频原始分辨率: {video_width}x{video_height}, 宽高比: {video_aspect_ratio:.2f}")
+    else:
+        video_width, video_height = 1920, 1080
+        video_aspect_ratio = 16/9
+        print("使用默认分辨率: 1920x1080")
+    
+    # 设置初始窗口大小
+    initial_width = 1000
+    initial_height = 800
+    initial_aspect_ratio = initial_width / initial_height
+    
+    window_name = 'Proportional Window with Original Resolution Video'
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, initial_width, initial_height)
+    
+    current_width = initial_width
+    current_height = initial_height
+    
+    zoom_factor = 1.0
+    zoom_step = 0.1
+    min_zoom = 1.0
+    max_zoom = 3.0
+    
+    day_night_mode = 2
+    day_night_text = ["DAY", "NIGHT", "AUTO"]
+    last_day_night_update = 0
+    
+    motion_detection_enabled = True
+    motion_grid = []
+    last_motion_value = 0
+    last_motion_update = 0
+    motion_sampling_interval = 0.5
+    motion_value_fixed = 0
+    mouse_x, mouse_y = 0, 0
+    mouse_in_window = False
+    # === 添加气泡弹窗变量 ===
+    bubble_messages = []  # 存储消息列表
+    bubble_duration = 2.0  # 显示2秒
+    bubble_fade_duration = 0.5  # 渐变消失时间
+
+    # ======================标记
+
+    last_memory_cleanup = time.time()  # 初始化内存清理时间
+    # 性能模式变量
+    performance_mode = "normal"
+    
+    # 绿框显示控制
+    green_box_visible = True  # 绿框是否显示
+    
+    # 性能监控变量
+    frame_times = []
+    low_performance_count = 0
+    last_performance_check = time.time()
+    
+    # 内存使用显示变量
+    memory_usage_fixed = 0
+    last_memory_update = 0
+    
+    def mouse_callback(event, x, y, flags, param):
+        nonlocal mouse_x, mouse_y, mouse_in_window, zoom_factor
+        
+        mouse_x, mouse_y = x, y
+        
+        if event == cv2.EVENT_MOUSEMOVE:
+            mouse_in_window = True
+        elif event == cv2.EVENT_MOUSEWHEEL:
+            if flags > 0:
+                zoom_factor = min(zoom_factor + zoom_step, max_zoom)
+            else:
+                zoom_factor = max(zoom_factor - zoom_step, min_zoom)
+            print(f"Zoom: {zoom_factor:.1f}x")
+          
+    cv2.setMouseCallback(window_name, mouse_callback)
+    
+    frame_count = 0
+    start_time = time.time()
+    fps = 0
+    last_fps_update = start_time
+    
+    last_bitrate_time = time.time()
+    current_camera_bitrate = get_rtsp_bitrate()
+    bitrate_frame_count = 0
+    
+    error_count = 0
+    max_errors_before_reconnect = 10
+    
+    print("Getting location information...")
+    lat, lon, city, country = get_location_by_ip()
+    
+    if lat is not None and lon is not None:
+        latitude, longitude = format_coordinates(lat, lon)
+        location_info = f"{city}, {country}"
+    else:
+        latitude = "Unknown"
+        longitude = "Unknown" 
+        location_info = "Location unavailable"
+    
+    print(f"Location: {location_info}")
+    print(f"Coordinates: {latitude}, {longitude}")
+    
+    last_location_update = time.time()
+    location_update_interval = 300
+    
+    last_valid_frame = None
+    
+    # 清空缓冲区
+    for _ in range(10):
+        cap.read()
+    
+    while True:
+        frame_start_time = time.time()
+        
+        # 定期清空视频缓冲区
+        if frame_count % 30 == 0:
+            for _ in range(3):  # 清空3帧缓冲
+                cap.grab()
+        
+        ret, frame = cap.read()
+        
+        if not ret or frame is None:
+            print("Failed to get frame or frame is None")
+            error_count += 1
+            
+            if error_count >= max_errors_before_reconnect:
+                print("Too many errors, attempting to reconnect...")
+                cap.release()
+                cap = reconnect_camera(rtsp_url)
+                if cap is None:
+                    print("Cannot reconnect, exiting...")
+                    break
+                error_count = 0
+                for _ in range(10):
+                    cap.read()
+                continue
+            
+            if last_valid_frame is not None:
+                frame = last_valid_frame.copy()
+            else:
+                frame = np.zeros((video_height, video_width, 3), dtype=np.uint8)
+                cv2.putText(frame, "NO VIDEO SIGNAL", (300, video_height//2), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3)
+        else:
+            error_count = 0
+            last_valid_frame = frame.copy()
+        
+        # 使用自适应运动检测
+        if motion_detection_enabled and frame is not None:
+            try:
+                motion_grid = adaptive_motion_detection(frame, fps)
+            except Exception as e:
+                print(f"运动检测错误: {e}")
+                motion_grid = []
+        else:
+            motion_grid = []
+        
+        # 运动网格数量采样（每0.5秒采样一次并固定显示）
+        current_time = time.time()
+        if current_time - last_motion_update >= motion_sampling_interval:
+            motion_value_fixed = len(motion_grid)
+            last_motion_update = current_time
+        
+        # 内存使用量采样（每0.5秒采样一次并固定显示）
+        if current_time - last_memory_update >= 0.5:
+            memory_usage_fixed = get_current_memory_usage()
+            last_memory_update = current_time
+        
+        # === 30秒自动内存清理 ===
+        if current_time - last_memory_cleanup >= 20:  # 20秒自动清理
+            try:
+                memory_usage = get_current_memory_usage()
+                cleanup_memory()
+                last_memory_cleanup = current_time
+                print(f"自动内存清理完成 - 清理前内存: {memory_usage:.1f}MB")
+            except Exception as e:
+                print(f"自动内存清理失败: {e}")
+        # ==========================================标记
+        
+        # 使用CUDA加速的缩放
+        if zoom_factor != 1.0 and frame is not None:
+            # 先缩小处理尺寸
+            small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+            zoomed_small = cuda_apply_zoom(small_frame, zoom_factor, mouse_x, mouse_y, current_width, current_height)
+            frame = cv2.resize(zoomed_small, (frame.shape[1], frame.shape[0]))
+        
+        # 更新帧率和比特率
+        frame_count += 1
+        current_time = time.time()
+        
+        if current_time - last_fps_update >= 1.0:
+            fps = frame_count / (current_time - last_fps_update)
+            frame_count = 0
+            last_fps_update = current_time
+        
+        # 性能监控和自动降级
+        frame_end_time = time.time()
+        frame_time = frame_end_time - frame_start_time
+        frame_times.append(frame_time)
+        
+        # 每10帧检查一次性能
+        if len(frame_times) >= 10:
+            avg_frame_time = np.mean(frame_times)
+            current_fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
+            
+            # 如果帧率过低，自动降低处理质量
+            if current_fps < 10:
+                low_performance_count += 1
+                if low_performance_count > 5:
+                    # 强制切换到快速模式
+                    performance_mode = "fast"
+                    print(f"性能过低，自动切换到快速模式，当前FPS: {current_fps:.1f}")
+            else:
+                low_performance_count = 0
+                
+            frame_times = frame_times[-5:]  # 只保留最近5帧的数据
+        
+        bitrate_frame_count += 1
+        if current_time - last_bitrate_time >= 1.0:
+            if last_valid_frame is not None:
+                compressed_frame_size = last_valid_frame.nbytes / 300
+                current_camera_bitrate = (compressed_frame_size * 8 * bitrate_frame_count) / 1000000
+            else:
+                current_camera_bitrate = 0.0
+            bitrate_frame_count = 0
+            last_bitrate_time = current_time
+        
+        # 更新日夜模式状态
+        if current_time - last_day_night_update >= 30:
+            current_mode = get_hikvision_day_night(cam_ip, cam_username, cam_password)
+            if current_mode != day_night_mode:
+                day_night_mode = current_mode
+                print(f"日夜模式状态同步: {day_night_text[day_night_mode]}")
+            last_day_night_update = current_time
+        
+        # 更新位置信息
+        if current_time - last_location_update >= location_update_interval:
+            lat, lon, city, country = get_location_by_ip()
+            if lat is not None and lon is not None:
+                latitude, longitude = format_coordinates(lat, lon)
+                location_info = f"{city}, {country}"
+            last_location_update = current_time
+        
+        # 窗口大小处理 - 保持比例
+        try:
+            win_rect = cv2.getWindowImageRect(window_name)
+            if win_rect[2] > 0 and win_rect[3] > 0:
+                win_width, win_height = win_rect[2], win_rect[3]
+                
+                # 如果窗口大小改变，检查是否需要调整比例
+                if win_width != current_width or win_height != current_height:
+                    current_ratio = win_width / win_height
+                    
+                    # 如果比例与初始比例不同，调整窗口大小保持比例
+                    if abs(current_ratio - initial_aspect_ratio) > 0.01:
+                        if win_width != current_width:  # 宽度改变
+                            new_height = int(win_width / initial_aspect_ratio)
+                            cv2.resizeWindow(window_name, win_width, new_height)
+                            current_width = win_width
+                            current_height = new_height
+                        else:  # 高度改变
+                            new_width = int(win_height * initial_aspect_ratio)
+                            cv2.resizeWindow(window_name, new_width, win_height)
+                            current_width = new_width
+                            current_height = win_height
+                    else:
+                        current_width = win_width
+                        current_height = win_height
+        except:
+            pass
+        
+        # 视频帧处理 - 在中央黑框中显示原始分辨率内容
+        window_ratio = current_width / current_height
+        
+        # 计算视频内容在窗口中的显示尺寸（保持视频原始宽高比）
+        if video_aspect_ratio > window_ratio:
+            # 窗口较窄，视频宽度等于窗口宽度
+            content_width = current_width
+            content_height = int(current_width / video_aspect_ratio)
+        else:
+            # 窗口较宽，视频高度等于窗口高度
+            content_height = current_height
+            content_width = int(current_height * video_aspect_ratio)
+        
+        # 调整视频帧到显示尺寸
+        try:
+            resized_frame = cv2.resize(frame, (content_width, content_height))
+        except:
+            resized_frame = np.zeros((content_height, content_width, 3), dtype=np.uint8)
+            cv2.putText(resized_frame, "DECODE ERROR", (50, content_height//2), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        
+        # 创建黑框背景
+        final_frame = np.zeros((current_height, current_width, 3), dtype=np.uint8)
+        
+        # 计算视频在中央的位置
+        x_offset = (current_width - content_width) // 2
+        y_offset = (current_height - content_height) // 2
+        
+        # 将视频帧放置在中央
+        final_frame[y_offset:y_offset+content_height, x_offset:x_offset+content_width] = resized_frame
+        
+        # 绘制运动检测网格 - 修复坐标映射
+        if green_box_visible and motion_grid and len(motion_grid) > 0:
+            # 批量绘制透明区域
+            overlay = final_frame.copy()
+            for (x, y, w, h) in motion_grid:
+                # 正确计算坐标映射
+                scale_x = content_width / frame.shape[1]
+                scale_y = content_height / frame.shape[0]
+                
+                display_x = int(x * scale_x) + x_offset
+                display_y = int(y * scale_y) + y_offset
+                display_w = int(w * scale_x)
+                display_h = int(h * scale_y)
+                
+                # 确保坐标在有效范围内
+                if (display_x < current_width and display_y < current_height and 
+                    display_x + display_w > 0 and display_y + display_h > 0):
+                    
+                    cv2.rectangle(overlay, 
+                                 (display_x, display_y), 
+                                 (display_x + display_w, display_y + display_h), 
+                                 (0, 255, 0), -1)
+            
+            # 一次性应用透明效果
+            cv2.addWeighted(overlay, 0.3, final_frame, 0.7, 0, final_frame)
+            
+            # 绘制边框
+            for (x, y, w, h) in motion_grid:
+                scale_x = content_width / frame.shape[1]
+                scale_y = content_height / frame.shape[0]
+                
+                display_x = int(x * scale_x) + x_offset
+                display_y = int(y * scale_y) + y_offset
+                display_w = int(w * scale_x)
+                display_h = int(h * scale_y)
+                
+                if (display_x < current_width and display_y < current_height and 
+                    display_x + display_w > 0 and display_y + display_h > 0):
+                    
+                    cv2.rectangle(final_frame, 
+                                 (display_x, display_y), 
+                                 (display_x + display_w, display_y + display_h), 
+                                 (0, 255, 0), 2)
+        
+        # 左上角信息（视频相关）
+        left_info_y = 30
+        cv2.putText(final_frame, f"Original: {video_width}x{video_height}", (10, left_info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        left_info_y += 30
+        
+        cv2.putText(final_frame, f"Display: {content_width}x{content_height}", (10, left_info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        left_info_y += 30
+        
+        cv2.putText(final_frame, f"Refresh Rate: {fps:.1f} FPS", (10, left_info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        left_info_y += 30
+        
+        status_color = (0, 255, 0) if error_count == 0 else (0, 165, 255)
+        status_text = "CONNECTED" if error_count == 0 else f"ERRORS: {error_count}"
+        cv2.putText(final_frame, f"Status: {status_text}", (10, left_info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
+        left_info_y += 25
+        
+        cv2.putText(final_frame, f"Window: {current_width}x{current_height}", (10, left_info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        left_info_y += 25
+        
+        cv2.putText(final_frame, f"Zoom: {zoom_factor:.1f}x (Mouse Wheel,Press Z to reset)", (10, left_info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+        left_info_y += 30
+        
+        # 左下角黑框中的系统信息
+        bottom_info_y = y_offset + content_height + 30
+        
+        # 在左下角显示CUDA状态
+        cuda_color = (0, 255, 0) if CUDA_AVAILABLE else (255, 0, 0)
+        cuda_status = "ENABLED" if CUDA_AVAILABLE else "DISABLED"
+        cv2.putText(final_frame, f"CUDA: {cuda_status}", (10, bottom_info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, cuda_color, 1)
+        bottom_info_y += 20
+        
+        cv2.putText(final_frame, f"Camera Bitrate: {current_camera_bitrate:.2f} Mbps", (10, bottom_info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        bottom_info_y += 20
+        
+        # 运动检测状态
+        cv2.putText(final_frame, f"Motion Detection: {'ON' if motion_detection_enabled else 'OFF'} (Press M)", 
+                   (10, bottom_info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0) if motion_detection_enabled else (255, 0, 0), 1)
+        bottom_info_y += 20
+        
+        cv2.putText(final_frame, f"Motion Grids: {motion_value_fixed}", 
+           (10, bottom_info_y), 
+           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        bottom_info_y += 20
+        
+        # 绿框显示状态
+        green_box_color = (0, 255, 0) if green_box_visible else (255, 0, 0)
+        green_box_status = "ON" if green_box_visible else "OFF"
+        cv2.putText(final_frame, f"Green Box: {green_box_status} (Press G)", 
+                   (10, bottom_info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, green_box_color, 1)
+        bottom_info_y += 20
+
+        # === 内存使用量显示（在性能模式上方）===
+        memory_color = (0, 255, 255)  # 黄色
+        cv2.putText(final_frame, f"Memory Usage: {memory_usage_fixed:.1f}MB (Press C)", 
+                   (current_width - 280, current_height - 70), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, memory_color, 1)
+
+        # 右下角信息 - 性能模式
+        perf_mode_text = f"Perf Mode: {performance_mode.upper()} (Press P)"
+        mode_color = (0, 255, 0) if performance_mode == "normal" else (0, 255, 255) if performance_mode == "optimized" else (255, 165, 0)
+        cv2.putText(final_frame, perf_mode_text, (current_width - 250, current_height - 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, mode_color, 1)
+        
+        # 右下角黑框信息 - 日夜模式状态
+        right_bottom_x = current_width - 250
+        right_bottom_y = current_height - 30
+
+        # 根据模式设置颜色
+        if day_night_mode == 0:  # 白天
+            color = (255, 255, 0)  # 黄色
+        elif day_night_mode == 1:  # 夜晚
+            color = (255, 255, 255)  # 白色
+        else:  # 自动
+            color = (0, 255, 255)  # 青色
+
+        cv2.putText(final_frame, f"Mode: {day_night_text[day_night_mode]} (Press N)", 
+                   (right_bottom_x, right_bottom_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        
+        # 右上角信息
+        current_time_str = get_system_time()
+        right_info_x = current_width - 380
+        right_info_y = 30
+        
+        cv2.putText(final_frame, f"Time: {current_time_str}", (right_info_x, right_info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        right_info_y += 25
+        
+        cv2.putText(final_frame, f"Location: {location_info}", (right_info_x, right_info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        right_info_y += 25
+        
+        cv2.putText(final_frame, f"Latitude: {latitude}", (right_info_x, right_info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        right_info_y += 25
+        
+        cv2.putText(final_frame, f"Longitude: {longitude}", (right_info_x, right_info_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # === 使用PIL绘制气泡弹窗 ===
+        current_time = time.time()
+        # 清理过期消息
+        bubble_messages = [msg for msg in bubble_messages 
+                          if current_time - msg['start_time'] < bubble_duration + bubble_fade_duration]
+
+        # 使用PIL绘制气泡消息（支持中文）
+        if bubble_messages:
+            final_frame = draw_bubble_messages_pil(final_frame, bubble_messages, current_width, current_height,
+                                                 bubble_duration, bubble_fade_duration)
+        # ===================标记
+        
+        # 视频边框
+        cv2.rectangle(final_frame, 
+                     (x_offset, y_offset), 
+                     (x_offset + content_width, y_offset + content_height), 
+                     (0, 255, 0), 2)
+        
+        cv2.imshow(window_name, final_frame)
+        
+        # 鼠标位置检测
+        try:
+            win_rect = cv2.getWindowImageRect(window_name)
+            if win_rect[2] > 0 and win_rect[3] > 0:
+                if (0 <= mouse_x < win_rect[2] and 0 <= mouse_y < win_rect[3]):
+                    mouse_in_window = True
+                else:
+                    mouse_in_window = False
+        except:
+            mouse_in_window = False
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('r'):
+            print("Manual reconnection requested...")
+            cap.release()
+            cap = reconnect_camera(rtsp_url)
+            if cap:
+                error_count = 0
+                for _ in range(10):
+                    cap.read()
+        elif key == ord('z'):
+            zoom_factor = 1.0
+            print("Zoom reset to 1.0x")
+            show_bubble_message(bubble_messages, "缩放已重置")
+        elif key == ord('n') or key == ord('N'):
+            day_night_mode = (day_night_mode + 1) % 3
+            success = set_hikvision_day_night(cam_ip, cam_username, cam_password, day_night_mode)
+            if success:
+                mode_names = ["白天", "夜晚", "自动"]
+                print(f"日夜模式已切换为: {mode_names[day_night_mode]}")
+                show_bubble_message(bubble_messages, f"日夜模式: {mode_names[day_night_mode]}")
+            else:
+                print("日夜模式切换失败，使用本地状态")
+                show_bubble_message(bubble_messages, "日夜模式切换失败")
+        elif key == ord('m') or key == ord('M'):
+            motion_detection_enabled = not motion_detection_enabled
+            status = "启用" if motion_detection_enabled else "禁用"
+            print(f"运动检测已{status}")
+            show_bubble_message(bubble_messages, f"运动检测: {status}")
+        elif key == ord('p') or key == ord('P'):
+            # 手动切换性能模式
+            if performance_mode == "normal":
+                performance_mode = "optimized"
+            elif performance_mode == "optimized":
+                performance_mode = "fast"
+            else:
+                performance_mode = "normal"
+            mode_names = {"normal": "标准", "optimized": "优化", "fast": "快速"}
+            print(f"性能模式切换为: {performance_mode.upper()}")
+            show_bubble_message(bubble_messages, f"性能模式: {mode_names[performance_mode]}")
+        elif key == ord('g') or key == ord('G'):
+            green_box_visible = not green_box_visible
+            status = "显示" if green_box_visible else "隐藏"
+            print(f"绿框已{status}")
+            show_bubble_message(bubble_messages, f"绿框: {status}")
+        elif key == ord('c') or key == ord('C'):
+            # 按C键手动清理内存
+            memory_usage = cleanup_memory()
+            show_bubble_message(bubble_messages, f"{memory_usage:.1f}MB内存手动清理完成！")
+            print("按C键手动内存清理完成")
+    
+    cap.release()
+    cv2.destroyAllWindows()
+
+# 运行程序
+if __name__ == "__main__":
+    proportional_window_resize_with_zoom()
