@@ -48,7 +48,7 @@ performance_mode = "normal"  # 性能模式：normal, optimized, fast
 # 绿框显示控制
 green_box_visible = True  # 绿框是否显示
 
-# === 添加内存优化变量 ===
+# 添加内存优化变量
 memory_pool = {}  # 对象池，避免频繁创建销毁
 last_memory_cleanup = 0
 memory_cleanup_interval = 30  # 每30秒清理一次
