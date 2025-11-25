@@ -1055,7 +1055,7 @@ def proportional_window_resize_with_zoom():
         cv2.putText(final_frame, f"Longitude: {longitude}", (right_info_x, right_info_y), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
-        # === 使用PIL绘制气泡弹窗 ===
+        # 使用PIL绘制气泡弹窗
         current_time = time.time()
         # 清理过期消息
         bubble_messages = [msg for msg in bubble_messages 
