@@ -1,2 +1,6 @@
 # StarRing-Monitor
-High-Performance Real-Time RTSP Monitoring System (25+ FPS on 10-year-old laptop)
+
+**单文件 · 零配置 · 高性能实时监控系统**
+
+```bash
+python StarRing-Monitor.py
